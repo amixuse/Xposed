@@ -16,7 +16,10 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 
 #if PLATFORM_SDK_VERSION >= 18
 #include <sys/capability.h>
@@ -79,6 +82,11 @@ bool initialize(bool zygote, bool startSystemServer, const char* className, int 
         return false;
 #endif
 
+    if (isMinimalFramework()) {
+        ALOGI("Not loading Xposed for minimal framework (encrypted device)");
+        return false;
+    }
+
     xposed->zygote = zygote;
     xposed->startSystemServer = startSystemServer;
     xposed->startClassName = className;
@@ -93,7 +101,7 @@ bool initialize(bool zygote, bool startSystemServer, const char* className, int 
 #endif  // XPOSED_WITH_SELINUX
 
     if (startSystemServer) {
-        xposed::logcat::start();
+        xposed::logcat::printStartupMarker();
     } else if (zygote) {
         // TODO Find a better solution for this
         // Give the primary Zygote process a little time to start first.
@@ -104,17 +112,24 @@ bool initialize(bool zygote, bool startSystemServer, const char* className, int 
     printRomInfo();
 
     if (startSystemServer) {
-#if PLATFORM_SDK_VERSION >= 21
-        htcAdjustSystemServerClassPath();
-#endif
-        if (!xposed::service::startAll())
+        if (!determineXposedInstallerUidGid() || !xposed::service::startAll()) {
             return false;
+        }
+        xposed::logcat::start();
 #if XPOSED_WITH_SELINUX
     } else if (xposed->isSELinuxEnabled) {
-        if (!xposed::service::startMembased())
+        if (!xposed::service::startMembased()) {
             return false;
+        }
 #endif  // XPOSED_WITH_SELINUX
     }
+
+#if XPOSED_WITH_SELINUX
+    // Don't let any further forks access the Zygote service
+    if (xposed->isSELinuxEnabled) {
+        xposed::service::membased::restrictMemoryInheritance();
+    }
+#endif  // XPOSED_WITH_SELINUX
 
     // FIXME Zygote has no access to input devices, this would need to be check in system_server context
     if (zygote && !isSafemodeDisabled() && detectSafemodeTrigger(shouldSkipSafemodeDelay()))
@@ -275,7 +290,7 @@ bool shouldIgnoreCommand(int argc, const char* const argv[]) {
         if (mightBeSuperuser && strcmp(argv[i], "--user") == 0)
             return true;
 
-        char* lastComponent = strrchr(argv[i], '.');
+        const char* lastComponent = strrchr(argv[i], '.');
         if (!lastComponent)
             continue;
 
@@ -297,7 +312,7 @@ static bool addPathToEnv(const char* name, const char* path) {
         char newPath[4096];
         int neededLength = snprintf(newPath, sizeof(newPath), "%s:%s", path, oldPath);
         if (neededLength >= (int)sizeof(newPath)) {
-            ALOGE("ERROR: %s would exceed %d characters", name, sizeof(newPath));
+            ALOGE("ERROR: %s would exceed %" PRIuPTR " characters", name, sizeof(newPath));
             return false;
         }
         setenv(name, newPath, 1);
@@ -332,16 +347,6 @@ bool addJarToClasspath() {
         return false;
     }
 }
-
-#if PLATFORM_SDK_VERSION >= 21
-/** On HTC ROMs, ensure that ub.jar is compiled before the system server is started. */
-void htcAdjustSystemServerClassPath() {
-    if (access("/system/framework/ub.jar", F_OK) != 0)
-        return;
-
-    addPathToEnv("SYSTEMSERVERCLASSPATH", "/system/framework/ub.jar");
-}
-#endif
 
 /** Callback which checks the loaded shared libraries for libdvm/libart. */
 static bool determineRuntime(const char** xposedLibPath) {
@@ -422,6 +427,73 @@ void setProcessName(const char* name) {
     set_process_name(name);
 }
 
+/** Determine the UID/GID of Xposed Installer. */
+bool determineXposedInstallerUidGid() {
+    if (xposed->isSELinuxEnabled) {
+        struct stat* st = (struct stat*) mmap(NULL, sizeof(struct stat), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (st == MAP_FAILED) {
+            ALOGE("Could not allocate memory in determineXposedInstallerUidGid(): %s", strerror(errno));
+            return false;
+        }
+
+        pid_t pid;
+        if ((pid = fork()) < 0) {
+            ALOGE("Fork in determineXposedInstallerUidGid() failed: %s", strerror(errno));
+            munmap(st, sizeof(struct stat));
+            return false;
+        } else if (pid == 0) {
+            // Child.
+#if XPOSED_WITH_SELINUX
+            if (setcon(ctx_app) != 0) {
+                ALOGE("Could not switch to %s context", ctx_app);
+                exit(EXIT_FAILURE);
+            }
+#endif  // XPOSED_WITH_SELINUX
+
+            if (TEMP_FAILURE_RETRY(stat(XPOSED_DIR, st)) != 0) {
+                ALOGE("Could not stat %s: %s", XPOSED_DIR, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+
+            exit(EXIT_SUCCESS);
+        }
+
+        // Parent.
+        int status;
+        if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            munmap(st, sizeof(struct stat));
+            return false;
+        }
+
+        xposed->installer_uid = st->st_uid;
+        xposed->installer_gid = st->st_gid;
+        munmap(st, sizeof(struct stat));
+        return true;
+    } else {
+        struct stat st;
+        if (TEMP_FAILURE_RETRY(stat(XPOSED_DIR, &st)) != 0) {
+            ALOGE("Could not stat %s: %s", XPOSED_DIR, strerror(errno));
+            return false;
+        }
+
+        xposed->installer_uid = st.st_uid;
+        xposed->installer_gid = st.st_gid;
+        return true;
+    }
+}
+
+/** Switch UID/GID to the ones of Xposed Installer. */
+bool switchToXposedInstallerUidGid() {
+    if (setresgid(xposed->installer_gid, xposed->installer_gid, xposed->installer_gid) != 0) {
+        ALOGE("Could not setgid(%d): %s", xposed->installer_gid, strerror(errno));
+        return false;
+    }
+    if (setresuid(xposed->installer_uid, xposed->installer_uid, xposed->installer_uid) != 0) {
+        ALOGE("Could not setuid(%d): %s", xposed->installer_uid, strerror(errno));
+        return false;
+    }
+    return true;
+}
 
 /** Drop all capabilities except for the mentioned ones */
 void dropCapabilities(int8_t keep[]) {
@@ -441,6 +513,20 @@ void dropCapabilities(int8_t keep[]) {
     }
 
     capset(&header, &cap[0]);
+}
+
+/**
+ * Checks whether the system is booting into a minimal Android framework.
+ * This is the case when the device is encrypted with a password that
+ * has to be entered on boot. /data is a tmpfs in that case, so we
+ * can't load any modules anyway.
+ * The system will reboot later with the full framework.
+ */
+bool isMinimalFramework() {
+    char voldDecrypt[PROPERTY_VALUE_MAX];
+    property_get("vold.decrypt", voldDecrypt, "");
+    return ((strcmp(voldDecrypt, "trigger_restart_min_framework") == 0) ||
+            (strcmp(voldDecrypt, "1") == 0));
 }
 
 }  // namespace xposed

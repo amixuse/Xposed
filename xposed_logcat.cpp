@@ -8,9 +8,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #include "xposed.h"
+#include "xposed_service.h"
 #include "xposed_logcat.h"
 
 
@@ -31,23 +33,25 @@ char marker[50];
 ////////////////////////////////////////////////////////////
 
 static void execLogcat() {
-    // Ensure that we're allowed to read all log entries
-    setresgid(AID_LOG, AID_LOG, AID_LOG);
     int8_t keep[] = { CAP_SYSLOG, -1 };
     xposed::dropCapabilities(keep);
 
     // Execute a logcat command that will keep running in the background
-    execl("/system/bin/logcat", "logcat",
-        "-v", "time",            // include timestamps in the log
-        "-s",                    // be silent by default, except for the following tags
-        "XposedStartupMarker:D", // marks the beginning of the current log
-        "Xposed:I",              // Xposed framework and default logging
-        "appproc:I",             // app_process
-        "XposedInstaller:I",     // Xposed Installer
-        "art:F",                 // ART crashes
-        "libc:F",                // Native crashes
-        "DEBUG:I",               // Native crashes
-        (char*) 0);
+    if (zygote_access(XPOSEDLOG_CONF_ALL, F_OK) == 0) {
+        execl("/system/bin/logcat", "logcat",
+            "-v", "time",            // include timestamps in the log
+            (char*) 0);
+    } else {
+        execl("/system/bin/logcat", "logcat",
+            "-v", "time",            // include timestamps in the log
+            "-s",                    // be silent by default, except for the following tags
+            "XposedStartupMarker:D", // marks the beginning of the current log
+            "Xposed:I",              // Xposed framework and default logging
+            "appproc:I",             // app_process
+            "XposedInstaller:I",     // Xposed Installer
+            "art:F",                 // ART crashes
+            (char*) 0);
+    }
 
     // We only get here in case of errors
     ALOGE("Could not execute logcat: %s", strerror(errno));
@@ -115,10 +119,12 @@ static void runDaemon(int pipefd) {
     exit(EXIT_FAILURE);
 }
 
-void start() {
+void printStartupMarker() {
     sprintf(marker, "Current time: %d, PID: %d", (int) time(NULL), getpid());
     ALOG(LOG_DEBUG, "XposedStartupMarker", marker, NULL);
+}
 
+void start() {
     // Fork to create a daemon
     pid_t pid;
     if ((pid = fork()) < 0) {
@@ -126,6 +132,16 @@ void start() {
         return;
     } else if (pid != 0) {
         return;
+    }
+
+    // Ensure that we're allowed to read all log entries
+    if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0) {
+        ALOGE("Failed to keep capabilities: %s", strerror(errno));
+    }
+    const gid_t groups[] = { AID_LOG };
+    setgroups(1, groups);
+    if (!xposed::switchToXposedInstallerUidGid()) {
+        exit(EXIT_FAILURE);
     }
 
 #if XPOSED_WITH_SELINUX
@@ -140,6 +156,7 @@ void start() {
     int err = rename(XPOSEDLOG, XPOSEDLOG_OLD);
     if (err < 0 && errno != ENOENT) {
         ALOGE("%s while renaming log file %s -> %s", strerror(errno), XPOSEDLOG, XPOSEDLOG_OLD);
+        exit(EXIT_FAILURE);
     }
 
     int pipeFds[2];
@@ -147,14 +164,12 @@ void start() {
         ALOGE("Could not allocate pipe for logcat output: %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
+    fcntl(pipeFds[0], F_SETPIPE_SZ, 1048576);
 
     if ((pid = fork()) < 0) {
         ALOGE("Fork for logcat execution failed: %s", strerror(errno));
         exit(EXIT_FAILURE);
     } else if (pid == 0) {
-        close(pipeFds[1]);
-        runDaemon(pipeFds[0]);
-    } else {
         close(pipeFds[0]);
         if (dup2(pipeFds[1], STDOUT_FILENO) == -1) {
             ALOGE("Could not redirect stdout: %s", strerror(errno));
@@ -165,6 +180,9 @@ void start() {
             exit(EXIT_FAILURE);
         }
         execLogcat();
+    } else {
+        close(pipeFds[1]);
+        runDaemon(pipeFds[0]);
     }
 
     // Should never reach this point

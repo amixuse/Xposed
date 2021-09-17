@@ -133,7 +133,7 @@ static bool init() {
     return true;
 }
 
-static void restrictMemoryInheritance() {
+void restrictMemoryInheritance() {
     madvise(shared, sizeof(MemBasedState), MADV_DONTFORK);
     canAlwaysAccessService = false;
 }
@@ -152,7 +152,7 @@ static inline bool isServiceAccessible() {
 void* looper(void* unused __attribute__((unused))) {
     pthread_mutex_lock(&shared->workerMutex);
     shared->state = STATE_IDLE;
-    pthread_cond_signal(&shared->workerCond);
+    pthread_cond_broadcast(&shared->workerCond);
     while (1) {
         while (shared->state != STATE_SERVICE_ACTION) {
             pthread_cond_wait(&shared->workerCond, &shared->workerMutex);
@@ -217,7 +217,7 @@ void* looper(void* unused __attribute__((unused))) {
         }
 
         shared->state = STATE_SERVER_RESPONSE;
-        pthread_cond_signal(&shared->workerCond);
+        pthread_cond_broadcast(&shared->workerCond);
     }
 
     pthread_mutex_unlock(&shared->workerMutex);
@@ -252,7 +252,7 @@ static inline void callService(Action action) {
     shared->action = action;
     shared->state = STATE_SERVICE_ACTION;
     shared->error = 0;
-    pthread_cond_signal(&shared->workerCond);
+    pthread_cond_broadcast(&shared->workerCond);
 
     while (shared->state != STATE_SERVER_RESPONSE) {
         pthread_cond_wait(&shared->workerCond, &shared->workerMutex);
@@ -262,7 +262,7 @@ static inline void callService(Action action) {
 static inline void makeIdle() {
     shared->action = OP_NONE;
     shared->state = STATE_IDLE;
-    pthread_cond_signal(&shared->workerCond);
+    pthread_cond_broadcast(&shared->workerCond);
     pthread_mutex_unlock(&shared->workerMutex);
 }
 
@@ -641,7 +641,7 @@ int XposedService::test() const {
 status_t XposedService::addService(const String16& name, const sp<IBinder>& service,
         bool allowIsolated) const {
     uid_t uid = IPCThreadState::self()->getCallingUid();
-    if (!isSystem || (uid != 0)) {
+    if (!isSystem || (uid != xposed->installer_uid)) {
         ALOGE("Permission denied, not adding service %s", String8(name).string());
         errno = EPERM;
         return -1;
@@ -818,8 +818,11 @@ static void systemService() {
     IPCThreadState::self()->joinThreadPool();
 }
 
-static void appService(bool useSingleProcess) {
-    xposed::setProcessName(useSingleProcess ? "xposed_service" : "xposed_service_app");
+static void appService() {
+    xposed::setProcessName("xposed_service_app");
+    if (!xposed::switchToXposedInstallerUidGid()) {
+        exit(EXIT_FAILURE);
+    }
     xposed::dropCapabilities();
 
 #if XPOSED_WITH_SELINUX
@@ -831,32 +834,11 @@ static void appService(bool useSingleProcess) {
     }
 #endif  // XPOSED_WITH_SELINUX
 
+    // We have to register the app service by using the already running system service as a proxy
     sp<IServiceManager> sm(defaultServiceManager());
-    status_t err;
-    if (useSingleProcess) {
-        // Initialize the system service here as this is the only service process
-#if PLATFORM_SDK_VERSION >= 16
-        err = sm->addService(String16(XPOSED_BINDER_SYSTEM_SERVICE_NAME), new binder::XposedService(true), true);
-#else
-        err = sm->addService(String16(XPOSED_BINDER_SYSTEM_SERVICE_NAME), new binder::XposedService(true));
-#endif
-        if (err != NO_ERROR) {
-            ALOGE("Error %d while adding system service %s", err, XPOSED_BINDER_SYSTEM_SERVICE_NAME);
-            exit(EXIT_FAILURE);
-        }
-
-        // The app service can be registered directly
-#if PLATFORM_SDK_VERSION >= 16
-        err = sm->addService(String16(XPOSED_BINDER_APP_SERVICE_NAME), new binder::XposedService(false), true);
-#else
-        err = sm->addService(String16(XPOSED_BINDER_APP_SERVICE_NAME), new binder::XposedService(false));
-#endif
-    } else {
-        // We have to register the app service by using the already running system service as a proxy
-        sp<IBinder> systemBinder = sm->getService(String16(XPOSED_BINDER_SYSTEM_SERVICE_NAME));
-        sp<binder::IXposedService> xposedSystemService = interface_cast<binder::IXposedService>(systemBinder);
-        err = xposedSystemService->addService(String16(XPOSED_BINDER_APP_SERVICE_NAME), new binder::XposedService(false), true);
-    }
+    sp<IBinder> systemBinder = sm->getService(String16(XPOSED_BINDER_SYSTEM_SERVICE_NAME));
+    sp<binder::IXposedService> xposedSystemService = interface_cast<binder::IXposedService>(systemBinder);
+    status_t err = xposedSystemService->addService(String16(XPOSED_BINDER_APP_SERVICE_NAME), new binder::XposedService(false), true);
 
     // Check result for the app service registration
     if (err != NO_ERROR) {
@@ -884,12 +866,9 @@ static void appService(bool useSingleProcess) {
 }
 
 bool checkMembasedRunning() {
-    // Don't let any further forks inherit this mapping
-    membased::restrictMemoryInheritance();
-
     // Ensure that the memory based service is running
     if (!membased::waitForRunning(5)) {
-        ALOGE("Zygote service is not running, Xposed cannot work without it");
+        ALOGE("Xposed's Zygote service is not running, cannot work without it");
         return false;
     }
 
@@ -897,16 +876,13 @@ bool checkMembasedRunning() {
 }
 
 bool startAll() {
-    bool useSingleProcess = !xposed->isSELinuxEnabled;
     if (xposed->isSELinuxEnabled && !membased::init()) {
         return false;
     }
 
     // system context service
     pid_t pid;
-    if (useSingleProcess) {
-        ALOGD("Using a single process for Xposed services");
-    } else if ((pid = fork()) < 0) {
+    if ((pid = fork()) < 0) {
         ALOGE("Fork for Xposed service in system context failed: %s", strerror(errno));
         return false;
     } else if (pid == 0) {
@@ -920,7 +896,7 @@ bool startAll() {
         ALOGE("Fork for Xposed service in app context failed: %s", strerror(errno));
         return false;
     } else if (pid == 0) {
-        appService(useSingleProcess);
+        appService();
         // Should never reach this point
         exit(EXIT_FAILURE);
     }
@@ -948,6 +924,9 @@ bool startMembased() {
         return false;
     } else if (pid == 0) {
         xposed::setProcessName("xposed_zygote_service");
+        if (!xposed::switchToXposedInstallerUidGid()) {
+            exit(EXIT_FAILURE);
+        }
         xposed::dropCapabilities();
         if (setcon(ctx_app) != 0) {
             ALOGE("Could not switch to %s context", ctx_app);

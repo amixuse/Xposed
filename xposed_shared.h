@@ -19,7 +19,11 @@
 #define ALOGV LOGV
 #endif
 
+#if PLATFORM_SDK_VERSION >= 24
+#define XPOSED_DIR "/data/user_de/0/de.robv.android.xposed.installer/"
+#else
 #define XPOSED_DIR "/data/data/de.robv.android.xposed.installer/"
+#endif
 
 namespace xposed {
 
@@ -31,6 +35,8 @@ struct XposedShared {
     uint32_t xposedVersionInt;
     bool isSELinuxEnabled;
     bool isSELinuxEnforcing;
+    uid_t installer_uid;
+    gid_t installer_gid;
 
     // Provided by runtime-specific library, used by executable
     void (*onVmCreated)(JNIEnv* env);
